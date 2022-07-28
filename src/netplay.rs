@@ -1,20 +1,16 @@
-use crate::{input::JoypadInput, settings::MAX_PLAYERS, Fps, MyGameState, FPS};
+use crate::{input::JoypadInput, settings::{MAX_PLAYERS, Settings}, Fps, MyGameState, FPS};
 use futures::{select, FutureExt};
 use futures_timer::Delay;
 use ggrs::{Config, GGRSRequest, NetworkStats, P2PSession, SessionBuilder};
-use matchbox_socket::{WebRtcSocket, WebRtcSocketConfig, RtcIceServerConfig};
+use matchbox_socket::{WebRtcSocket, WebRtcSocketConfig, RtcIceServerConfig, RtcIceCredentials, RtcIcePasswordCredentials};
 use rusticnes_core::nes::NesState;
 use serde::Deserialize;
+use uuid::Uuid;
 use std::{
     collections::VecDeque,
     time::{Duration, Instant},
 };
 use tokio::runtime::Runtime;
-
-#[derive(Deserialize)]
-pub struct NetplayBuildConfiguration {
-    matchbox_server: String,
-}
 
 impl Clone for MyGameState {
     fn clone(&self) -> Self {
@@ -71,47 +67,103 @@ pub struct NetplaySession {
     frame: Frame,
     pub stats: [NetplayStats; MAX_PLAYERS],
 }
+pub struct ConnectingState {
+    pub socket: Option<WebRtcSocket>,
+    ggrs_config: GGRSConfiguration,
+}
 
 #[allow(clippy::large_enum_variant)]
 pub enum NetplayState {
     Disconnected,
-    Connecting(Option<WebRtcSocket>),
+    Connecting(ConnectingState),
     Connected(NetplaySession),
 }
 
 type Frame = i32;
 pub struct Netplay {
     rt: Runtime,
-    matchbox_server: String,
     pub state: NetplayState,
     last_real_frame: Frame,
-
+    pub config: NetplayBuildConfiguration,
     pub room_name: String,
+}
+
+#[derive(Deserialize, Clone)]
+pub struct NetplayBuildConfiguration {
+    pub default_room_name: String,
+    pub netplay_id: Option<String>,
+    pub server: NetplayServerConfiguration,
+}
+
+#[derive(Deserialize, Clone)]
+pub struct IcePasswordCredentials {
+    username: String,
+    password: String,
+}
+#[derive(Deserialize, Clone)]
+pub enum IceCredentials {
+    None,
+    Password(IcePasswordCredentials)
+}
+#[derive(Deserialize, Clone)]
+pub struct IceConfiguration {
+    urls: Vec<String>,
+    credentials: IceCredentials,
+}
+
+#[derive(Deserialize, Clone)]
+pub struct MatchboxConfiguration {
+    server: String,
+    ice: IceConfiguration,
+}
+
+#[derive(Deserialize, Clone)]
+pub struct GGRSConfiguration {
     pub max_prediction: usize,
     pub input_delay: usize,
 }
+#[derive(Deserialize, Clone)]
+pub struct StaticNetplayServerConfiguration {
+    matchbox: MatchboxConfiguration,
+    pub ggrs: GGRSConfiguration,
+}
+
+#[derive(Deserialize, Clone)]
+pub enum NetplayServerConfiguration {
+    Static(StaticNetplayServerConfiguration),
+}
+
 impl Netplay {
-    pub fn new(netplay_build_config: &NetplayBuildConfiguration) -> Self {
+    pub fn new(config: &NetplayBuildConfiguration) -> Self {
+        let room_name = config.default_room_name.clone();
         Netplay {
             rt: Runtime::new().expect("Could not create an async runtime"),
-            matchbox_server: netplay_build_config.matchbox_server.clone(),
             state: NetplayState::Disconnected,
             last_real_frame: -1,
-            room_name: "example_room".to_string(),
-            max_prediction: 12,
-            input_delay: 2,
+            config: config.clone(),
+            room_name,
         }
     }
 
+    pub fn get_netplay_id(&self, settings: &mut Settings) -> String {
+        self.config.netplay_id.as_ref().unwrap_or_else(|| {
+            settings.netplay_id.get_or_insert_with(|| Uuid::new_v4().to_string())
+        }).clone()
+    }
+
     pub fn connect(&mut self, room: &str) {
-        let matchbox_server = &self.matchbox_server;
-        //TODO: Enable TURN servers, but can't figure out where to put credentials.
+        let NetplayServerConfiguration::Static(conf) = &self.config.server;
+        let matchbox_server = &conf.matchbox.server;
+        let credentials = match &conf.matchbox.ice.credentials {
+            IceCredentials::Password(IcePasswordCredentials { username, password }) => RtcIceCredentials::Password(RtcIcePasswordCredentials { username: username.to_string(), password: password.to_string() }),
+            IceCredentials::None => RtcIceCredentials::None,
+        };
+
         let (socket, loop_fut) = WebRtcSocket::new_with_config(WebRtcSocketConfig {
             room_url: format!("ws://{matchbox_server}/{room}"),
             ice_server: RtcIceServerConfig {
-                urls: vec![
-                    "stun:stun.l.google.com:19302".to_string(),
-                ],
+                urls: conf.matchbox.ice.urls.clone(),
+                credentials
             },
         });
 
@@ -135,7 +187,7 @@ impl Netplay {
             }
         });
 
-        self.state = NetplayState::Connecting(Some(socket));
+        self.state = NetplayState::Connecting(ConnectingState { socket: Some(socket), ggrs_config: conf.ggrs.clone() });
     }
 
     pub fn advance(
@@ -147,20 +199,20 @@ impl Netplay {
             NetplayState::Disconnected => {
                 game_state.advance(inputs);
             }
-            NetplayState::Connecting(s) => {
+            NetplayState::Connecting(connecting_state) => {
                 game_state.advance(inputs);
 
-                if let Some(socket) = s {
+                if let Some(socket) = &mut connecting_state.socket {
                     socket.accept_new_connections();
                     let connected_peers = socket.connected_peers().len();
                     let remaining = MAX_PLAYERS - (connected_peers + 1);
                     if remaining == 0 {
                         let players = socket.players();
-
+                        let ggrs_config = &connecting_state.ggrs_config;
                         let mut sess_build = SessionBuilder::<GGRSConfig>::new()
                             .with_num_players(MAX_PLAYERS)
-                            .with_max_prediction_window(self.max_prediction)
-                            .with_input_delay(self.input_delay)
+                            .with_max_prediction_window(ggrs_config.max_prediction)
+                            .with_input_delay(ggrs_config.input_delay)
                             .with_fps(FPS as usize)
                             .expect("invalid fps");
 
@@ -172,7 +224,7 @@ impl Netplay {
 
                         self.state = NetplayState::Connected(NetplaySession {
                             p2p_session: sess_build
-                                .start_p2p_session(s.take().unwrap())
+                                .start_p2p_session(connecting_state.socket.take().unwrap())
                                 .expect("failed to start session"),
                             frame: 0,
                             stats: [NetplayStats::new(), NetplayStats::new()],
@@ -222,7 +274,6 @@ impl Netplay {
                                     cell.save(*frame, Some(game_state.clone()), None);
                                 }
                                 GGRSRequest::AdvanceFrame { inputs } => {
-                                    //println!("Advancing (frame {:?})", game_runner.get_frame());
                                     game_state.advance([
                                         JoypadInput(inputs[0].0),
                                         JoypadInput(inputs[1].0),
@@ -243,7 +294,6 @@ impl Netplay {
                         println!("Frame {} skipped: PredictionThreshold", frame);
                     }
                     Err(ggrs::GGRSError::NotSynchronized) => {
-                        //println!("Synchronizing...");
                     }
                     Err(e) => eprintln!("Ouch :( {:?}", e),
                 }
